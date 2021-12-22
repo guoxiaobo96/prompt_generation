@@ -9,16 +9,21 @@ from typing import Callable, Dict, Optional
 import torch
 
 import numpy as np
+import transformers
 
 from transformers.trainer import Trainer
 from transformers import AutoConfig, AutoModelForSequenceClassification, AutoTokenizer, EvalPrediction
 from transformers import GlueDataTrainingArguments as DataTrainingArguments
 from transformers import HfArgumentParser, TrainingArguments, set_seed
+from transformers import BertForSequenceClassification, RobertaForSequenceClassification
+from transformers.utils.dummy_pt_objects import RobertaModel
 
-from src.dataset import FewShotDataset
-from src.ml_models import BertForPromptFinetuning, RobertaForPromptFinetuning, resize_token_type_embeddings
-from src.processors import processors_mapping, num_labels_mapping, output_modes_mapping, compute_metrics_mapping, bound_mapping
-from src.config import MiscArgument, DynamicDataTrainingArguments, GeneratorArgument, MLModelArguments, TrainingArguments
+from dataset import FewShotDataset, PromptDataset, few_shot_data_collator, FilterDataset
+from ml_models import BertForPromptFinetuning, RobertaForPromptFinetuning, resize_token_type_embeddings, filter_metrics
+from processors import processors_mapping, num_labels_mapping, output_modes_mapping, compute_metrics_mapping, bound_mapping
+from config import MiscArgument, DynamicDataTrainingArguments, GeneratorArgument, FilterModelArguments, MLModelArguments, TrainingArguments, get_config
+from generator import Generator
+from trainer import Trainer
 
 from filelock import FileLock
 from datetime import datetime
@@ -30,353 +35,291 @@ import json
 logger = logging.getLogger(__name__)
 
 
-def main(misc_ars: MiscArgument, data_args: DynamicDataTrainingArguments, generator_args: GeneratorArgument, ml_model_args: MLModelArguments, training_args: TrainingArguments):
-    # Setup logging
-    logging.basicConfig(
-        format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",
-        datefmt="%m/%d/%Y %H:%M:%S",
-        level=logging.INFO if training_args.local_rank in [-1, 0] else logging.WARN,
-    )
 
-    # Load prompt/template/mapping file
-    if data_args.prompt:
-        if data_args.prompt_path is not None:
-            assert data_args.prompt_id is not None
-            prompt_list = []
-            with open(data_args.prompt_path) as f:
-                for line in f:
-                    line = line.strip()
-                    template, mapping = line.split('\t')
-                    prompt_list.append((template, mapping))
-
-            data_args.template, data_args.mapping = prompt_list[data_args.prompt_id] 
-            logger.info("Specify load the %d-th prompt: %s | %s" % (data_args.prompt_id, data_args.template, data_args.mapping))
-        else:
-            if data_args.template_path is not None:
-                with open(data_args.template_path) as f:
-                    data_args.template_list = []
-                    for line in f:
-                        line = line.strip()
-                        if len(line) > 0:
-                            data_args.template_list.append(line)
-
-                # Load top-n templates
-                if data_args.top_n_template is not None:
-                    data_args.template_list = data_args.template_list[:data_args.top_n_template]
-                logger.info("Load top-%d templates from %s" % (len(data_args.template_list), data_args.template_path))
-
-                # ... or load i-th template
-                if data_args.template_id is not None:
-                    data_args.template = data_args.template_list[data_args.template_id]
-                    data_args.template_list = None
-                    logger.info("Specify load the %d-th template: %s" % (data_args.template_id, data_args.template))
-
-            if data_args.mapping_path is not None:
-                assert data_args.mapping_id is not None # Only can use one label word mapping
-                with open(data_args.mapping_path) as f:
-                    mapping_list = []
-                    for line in f:
-                        line = line.strip()
-                        mapping_list.append(line)
-
-                data_args.mapping = mapping_list[data_args.mapping_id]
-                logger.info("Specify using the %d-th mapping: %s" % (data_args.mapping_id, data_args.mapping))
-
-    # Check save path
-    if (
-        os.path.exists(training_args.output_dir)
-        and os.listdir(training_args.output_dir)
-        and training_args.do_train
-        and not training_args.overwrite_output_dir
-    ):
-        raise ValueError(f"Output directory ({training_args.output_dir}) already exists.")
-
-    logger.warning(
-        "Process rank: %s, device: %s, n_gpu: %s, distributed training: %s, 16-bits training: %s",
-        training_args.local_rank,
-        training_args.device,
-        training_args.n_gpu,
-        bool(training_args.local_rank != -1),
-        training_args.fp16,
-    )
-    logger.info("Training/evaluation parameters %s", training_args)
-
-    # Set seed
-    set_seed(training_args.seed)
-
-    try:
-        num_labels = num_labels_mapping[data_args.task_name]
-        output_mode = output_modes_mapping[data_args.task_name]
-        logger.info("Task name: {}, number of labels: {}, output mode: {}".format(data_args.task_name, num_labels, output_mode))
-    except KeyError:
-        raise ValueError("Task not found: %s" % (data_args.task_name))
-
-    # Automatically generate template for using demonstrations
-    if data_args.auto_demo and ml_model_args.few_shot_type == 'prompt-demo':
-        # GPT-3's in-context learning
-        if data_args.gpt3_in_context_head or data_args.gpt3_in_context_tail: 
-            logger.info("Automatically convert the template to GPT-3's in-context learning.")
-            assert data_args.template_list is None
-
-            old_template = data_args.template
-            new_template = old_template + ''
-            old_template = old_template.replace('*cls*', '')
-            # Single sentence or sentence pair?
-            sent_num = 1
-            if "_1" in old_template:
-                sent_num = 2
-            for instance_id in range(data_args.gpt3_in_context_num):
-                sub_template = old_template + ''
-                # Replace sent_id
-                for sent_id in range(sent_num):
-                    sub_template = sub_template.replace("_{}*".format(sent_id), "_{}*".format(sent_num + sent_num * instance_id + sent_id))
-                # Replace mask
-                sub_template = sub_template.replace("*mask*", "*labelx_{}*".format(instance_id))
-                if data_args.gpt3_in_context_tail:
-                    new_template = new_template + sub_template # Put context at the end
-                else:
-                    new_template = sub_template + new_template # Put context at the beginning
-            logger.info("| {} => {}".format(data_args.template, new_template))
-            data_args.template = new_template
-        else:
-            logger.info("Automatically convert the template to using demonstrations.")
-            if data_args.template_list is not None:
-                for i in range(len(data_args.template_list)):
-                    old_template = data_args.template_list[i]
-                    new_template = old_template + ''
-                    old_template = old_template.replace('*cls*', '')
-                    # Single sentence or sentence pair?
-                    sent_num = 1
-                    if "_1" in old_template:
-                        sent_num = 2
-                    for label_id in range(num_labels):
-                        sub_template = old_template + ''
-                        # Replace sent id
-                        for sent_id in range(sent_num):
-                            sub_template = sub_template.replace("_{}*".format(sent_id), "_{}*".format(sent_num + sent_num * label_id + sent_id))
-                        # Replace mask
-                        sub_template = sub_template.replace("*mask*", "*label_{}*".format(label_id))
-                        new_template = new_template + sub_template
-                    logger.info("| {} => {}".format(data_args.template_list[i], new_template))
-                    data_args.template_list[i] = new_template
+def generate_prompts(misc_args: MiscArgument, data_args: DynamicDataTrainingArguments, generator_args: GeneratorArgument):
+    generator = Generator(misc_args, generator_args)
+    for mode in ['train', 'dev','test']:
+        dataset = PromptDataset(data_args, tokenizer=generator.tokenizer, mode=mode)
+        data = list()
+        for item in tqdm(dataset,total=len(dataset)):
+            generated_sentence_list = generator.generate(item.text_a)
+            generated_sentence_list = [item[1] for item in generated_sentence_list]
+            record = {'guid':item.guid, 'text_a':item.text_a, 'gen_text_a':generated_sentence_list,'text_b':item.text_b}
+            if item.text_b is not None:
+                generated_sentence_list = generator.generate(item.text_b)
+                generated_sentence_list = [item[1] for item in generated_sentence_list]
+                record['gen_text_b'] = generated_sentence_list
             else:
-                old_template = data_args.template
-                new_template = old_template + ''
-                old_template = old_template.replace('*cls*', '')
-                # Single sentence or sentence pair?
-                sent_num = 1
-                if "_1" in old_template:
-                    sent_num = 2
-                for label_id in range(num_labels):
-                    sub_template = old_template + ''
-                    # Replace sent id
-                    for sent_id in range(sent_num):
-                        sub_template = sub_template.replace("_{}".format(sent_id), "_{}".format(sent_num + sent_num * label_id + sent_id))
-                    # Replace mask
-                    sub_template = sub_template.replace("*mask*", "*label_{}*".format(label_id))
-                    new_template = new_template + sub_template
-                logger.info("| {} => {}".format(data_args.template, new_template))
-                data_args.template = new_template
+                record['gen_text_b'] = list()
+            record['label'] = item.label
+            data.append(record)
+        prompt_file = os.path.join(data_args.data_dir,mode+'_prompt')
+        with open(prompt_file,mode='w',encoding='utf8') as fp:
+            for item in data:
+                fp.write(json.dumps(item,ensure_ascii=False)+'\n')
+        
 
+def generate_score(misc_args: MiscArgument, data_args: DynamicDataTrainingArguments, generator_args: GeneratorArgument, ml_model_args: MLModelArguments, training_args: TrainingArguments):
     # Create config
+    num_labels = num_labels_mapping[data_args.task_name]
     config = AutoConfig.from_pretrained(
-        ml_model_args.config_name if ml_model_args.config_name else ml_model_args.model_name_or_path,
+        ml_model_args.ml_config_name if ml_model_args.ml_config_name else ml_model_args.ml_model_name_or_path,
         num_labels=num_labels,
-        finetuning_task=data_args.task_name,
-        cache_dir=ml_model_args.cache_dir,
+        cache_dir=ml_model_args.ml_cache_dir,
     )
 
-    if 'prompt' in ml_model_args.few_shot_type:
-        if config.model_type == 'roberta':
-            model_fn = RobertaForPromptFinetuning
-        elif config.model_type == 'bert':
-            model_fn = BertForPromptFinetuning
-        else:
-            raise NotImplementedError
-    elif ml_model_args.few_shot_type == 'finetune':
-        model_fn = AutoModelForSequenceClassification
+    if config.model_type == 'roberta':
+        model_fn = RobertaForPromptFinetuning
+    elif config.model_type == 'bert':
+        model_fn = BertForPromptFinetuning
     else:
         raise NotImplementedError
     special_tokens = []
 
     # Create tokenizer
     tokenizer = AutoTokenizer.from_pretrained(
-        ml_model_args.tokenizer_name if ml_model_args.tokenizer_name else ml_model_args.model_name_or_path,
+        ml_model_args.ml_tokenizer_name if ml_model_args.ml_tokenizer_name else ml_model_args.ml_model_name_or_path,
         additional_special_tokens=special_tokens,
-        cache_dir=ml_model_args.cache_dir,
+        cache_dir=ml_model_args.ml_cache_dir,
     )
-
-    # Get our special datasets.
-    train_dataset = (
-        FewShotDataset(data_args, tokenizer=tokenizer, mode="train", use_demo=("demo" in ml_model_args.few_shot_type))
-    )
-    eval_dataset = (
-        FewShotDataset(data_args, tokenizer=tokenizer, mode="dev", use_demo=("demo" in ml_model_args.few_shot_type))
-        if training_args.do_eval
-        else None
-    )
-    test_dataset = (
-        FewShotDataset(data_args, tokenizer=tokenizer, mode="test", use_demo=("demo" in ml_model_args.few_shot_type))
-        if training_args.do_predict
-        else None
-    )
-
-    set_seed(training_args.seed)
 
     model = model_fn.from_pretrained(
-        ml_model_args.model_name_or_path,
-        from_tf=bool(".ckpt" in ml_model_args.model_name_or_path),
+        ml_model_args.ml_model_name_or_path,
+        from_tf=bool(".ckpt" in ml_model_args.ml_model_name_or_path),
         config=config,
-        cache_dir=ml_model_args.cache_dir,
+        cache_dir=ml_model_args.ml_cache_dir,
     )
 
     # For BERT, increase the size of the segment (token type) embeddings
     if config.model_type == 'bert':
         model.resize_token_embeddings(len(tokenizer))
-        resize_token_type_embeddings(model, new_num_types=10, random_segment=ml_model_args.random_segment)
+        resize_token_type_embeddings(model, new_num_types=10, random_segment=ml_model_args.ml_random_segment)
 
     # Pass dataset and argument information to the model
-    if data_args.prompt:
-        model.label_word_list = torch.tensor(train_dataset.label_word_list).long().cuda()
-    if output_modes_mapping[data_args.task_name] == 'regression':
-        # lower / upper bounds
-        model.lb, model.ub = bound_mapping[data_args.task_name]
-    model.ml_model_args = ml_model_args
+    model.model_args = ml_model_args
     model.data_args = data_args
     model.tokenizer = tokenizer
+    model.vocab = list(tokenizer.get_vocab())
+    model.return_full_softmax = True
 
-    # Build metric
-    def build_compute_metrics_fn(task_name: str) -> Callable[[EvalPrediction], Dict]:
-        def compute_metrics_fn(p: EvalPrediction):
-            # Note: the eval dataloader is sequential, so the examples are in order.
-            # We average the logits over each sample for using demonstrations.
-            predictions = p.predictions
-            num_logits = predictions.shape[-1]
-            logits = predictions.reshape([eval_dataset.num_sample, -1, num_logits])
-            logits = logits.mean(axis=0)
-            
-            if num_logits == 1:
-                preds = np.squeeze(logits)
+
+
+    for mode in ['train','dev','test']:
+        # Initialize our Trainer
+        trainer = Trainer(
+            model=model,
+            args=training_args,
+            train_dataset=None,
+            eval_dataset=None,
+            data_collator = few_shot_data_collator
+        )
+    # First we compute zero-shot logits on all of the examples.
+        dataset = FewShotDataset(misc_args, data_args, tokenizer=tokenizer, mode=mode)
+
+        # Predict logits.
+        dataloader = trainer.get_eval_dataloader(dataset)
+        output = trainer.prediction_loop(dataloader, description="Evaluation")
+        logits = output.predictions[0] if isinstance(output.predictions, (list, tuple)) else output.predictions
+        labels = output.label_ids
+        record_list = list()
+        for i, item in enumerate(dataset):
+            if i >= len(dataset):
+                break
+            text = item.sentence[0] + item.prompts
+            if len(item.sentence) > 1:
+                text += item.sentence[1]
+            text = text.replace('  ',' ')
+            score = '0'
+            if logits[i][0] == logits[i][1]:
+                score = '0'
             else:
-                preds = np.argmax(logits, axis=1)
-
-            # Just for sanity, assert label ids are the same.
-            label_ids = p.label_ids.reshape([eval_dataset.num_sample, -1])
-            label_ids_avg = label_ids.mean(axis=0)
-            label_ids_avg = label_ids_avg.astype(p.label_ids.dtype)
-            assert (label_ids_avg - label_ids[0]).mean() < 1e-2
-            label_ids = label_ids[0]
-
-            return compute_metrics_mapping[task_name](task_name, preds, label_ids)
-
-        return compute_metrics_fn
+                pred_label = np.argmax(logits[i])
+                if pred_label == labels[i]:
+                    score = '1'
+            record_list.append({'text':text,'label':score})
+        record_file = os.path.join(data_args.data_dir, mode+'_score')
+        with open(record_file,mode='w',encoding='utf8') as fp:
+            for item in record_list:
+                fp.write(json.dumps(item,ensure_ascii=False)+'\n')
+    return
     
+
+
+def train_filter(misc_args: MiscArgument, data_args: DynamicDataTrainingArguments, generator_args: GeneratorArgument, filter_model_args: FilterModelArguments, training_args: TrainingArguments):
+    # Create config
+    num_labels = num_labels_mapping[data_args.task_name]
+    config = AutoConfig.from_pretrained(
+        filter_model_args.filter_config_name if filter_model_args.filter_config_name else filter_model_args.filter_model_name_or_path,
+        num_labels=num_labels,
+        cache_dir=filter_model_args.filter_cache_dir,
+    )
+
+    if config.model_type == 'roberta':
+        model_fn = RobertaForSequenceClassification
+    elif config.model_type == 'bert':
+        model_fn = BertForSequenceClassification
+    else:
+        raise NotImplementedError
+    special_tokens = []
+
+    # Create tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(
+        filter_model_args.filter_tokenizer_name if filter_model_args.filter_tokenizer_name else filter_model_args.filter_model_name_or_path,
+        additional_special_tokens=special_tokens,
+        cache_dir=filter_model_args.filter_cache_dir,
+    )
+
+    model = model_fn.from_pretrained(
+        filter_model_args.filter_model_name_or_path,
+        from_tf=bool(".ckpt" in filter_model_args.filter_model_name_or_path),
+        config=config,
+        cache_dir=filter_model_args.filter_cache_dir,
+    )
+
+    # For BERT, increase the size of the segment (token type) embeddings
+    if config.model_type == 'bert':
+        model.resize_token_embeddings(len(tokenizer))
+        resize_token_type_embeddings(model, new_num_types=10, random_segment=filter_model_args.filter_random_segment)
+
+    # Pass dataset and argument information to the model
+    model.model_args = filter_model_args
+    model.data_args = data_args
+    model.tokenizer = tokenizer
+    model.vocab = list(tokenizer.get_vocab())
+
     # Initialize our Trainer
-    trainer = Trainer(
+
+    train_dataset = FilterDataset(misc_args, data_args, tokenizer=tokenizer, mode='train')
+    eval_dataset = FilterDataset(misc_args, data_args, tokenizer=tokenizer, mode='dev')
+    trainer = transformers.Trainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
-        compute_metrics=build_compute_metrics_fn(data_args.task_name)
+        compute_metrics=filter_metrics
+    )
+    trainer.train()
+    eval_res = trainer.evaluate()
+    if trainer.is_world_process_zero():
+        trainer.save_model(training_args.output_dir)
+        tokenizer.save_pretrained(training_args.output_dir)
+        torch.save(filter_model_args, os.path.join(training_args.output_dir, "model_args.bin"))
+        torch.save(data_args, os.path.join(training_args.output_dir, "data_args.bin"))
+        torch.save(training_args, os.path.join(training_args.output_dir, "training_args.bin"))
+    return
+    
+
+def train_ml(misc_args: MiscArgument, data_args: DynamicDataTrainingArguments, generator_args: GeneratorArgument, filter_model_args: FilterModelArguments, ml_model_args: MLModelArguments, training_args: TrainingArguments):
+    num_labels = num_labels_mapping[data_args.task_name]
+    ml_config = AutoConfig.from_pretrained(
+        ml_model_args.ml_config_name if ml_model_args.ml_config_name else ml_model_args.ml_model_name_or_path,
+        num_labels=num_labels,
+        cache_dir=ml_model_args.ml_cache_dir,
     )
 
-    # Training
-    if training_args.do_train:
-        trainer.train(model_path=ml_model_args.model_name_or_path if os.path.isdir(ml_model_args.model_name_or_path) else None)
-        # Use the early stop, so do not save the model in the end (unless specify save_at_last)
-        if training_args.save_at_last:
-            trainer.save_model(training_args.output_dir)
- 
-        if trainer.is_world_master():
-            tokenizer.save_pretrained(training_args.output_dir)
-            torch.save(ml_model_args, os.path.join(training_args.output_dir, "ml_model_args.bin"))
-            torch.save(data_args, os.path.join(training_args.output_dir, "data_args.bin"))
-        
-        # Reload the best checkpoint (for eval)
-        model = model_fn.from_pretrained(training_args.output_dir)
-        model = model.to(training_args.device)
-        trainer.model = model
-        if data_args.prompt:
-            model.label_word_list = torch.tensor(train_dataset.label_word_list).long().cuda()
-        if output_modes_mapping[data_args.task_name] == 'regression':
-            # lower / upper bounds
-            model.lb, model.ub = bound_mapping[data_args.task_name]
-        model.ml_model_args = ml_model_args
-        model.data_args = data_args
-        model.tokenizer = tokenizer
+    if ml_config.model_type == 'roberta':
+        model_fn = RobertaForPromptFinetuning
+    elif ml_config.model_type == 'bert':
+        model_fn = BertForPromptFinetuning
+    else:
+        raise NotImplementedError
+    special_tokens = []
+    # Create tokenizer
+    ml_tokenizer = AutoTokenizer.from_pretrained(
+        ml_model_args.ml_tokenizer_name if ml_model_args.ml_tokenizer_name else ml_model_args.ml_model_name_or_path,
+        additional_special_tokens=special_tokens,
+        cache_dir=ml_model_args.ml_cache_dir,
+    )
 
-    # Evaluation
-    final_result = {
-        'time': str(datetime.today()),
-    }
+    ml_model = model_fn.from_pretrained(
+        ml_model_args.ml_model_name_or_path,
+        from_tf=bool(".ckpt" in ml_model_args.ml_model_name_or_path),
+        config=ml_config,
+        cache_dir=ml_model_args.ml_cache_dir,
+    )
 
-    eval_results = {}
-    if training_args.do_eval:
-        logger.info("*** Validate ***")
+    # For BERT, increase the size of the segment (token type) embeddings
+    if ml_config.model_type == 'bert':
+        ml_model.resize_token_embeddings(len(ml_tokenizer))
+        resize_token_type_embeddings(ml_model, new_num_types=10, random_segment=ml_model_args.ml_random_segment)
 
-        eval_datasets = [eval_dataset]
+    # Pass dataset and argument information to the model
+    ml_model.model_args = ml_model_args
+    ml_model.data_args = data_args
+    ml_model.tokenizer = ml_tokenizer
+    ml_model.vocab = list(ml_tokenizer.get_vocab())
 
-        for eval_dataset in eval_datasets:
-            trainer.compute_metrics = build_compute_metrics_fn(eval_dataset.args.task_name)
-            output = trainer.evaluate(eval_dataset=eval_dataset)
-            eval_result = output.metrics 
 
-            output_eval_file = os.path.join(
-                training_args.output_dir, f"eval_results_{eval_dataset.args.task_name}.txt"
-            )
-            if trainer.is_world_master():
-                with open(output_eval_file, "w") as writer:
-                    logger.info("***** Eval results {} *****".format(eval_dataset.args.task_name))
-                    for key, value in eval_result.items():
-                        logger.info("  %s = %s", key, value)
-                        writer.write("%s = %s\n" % (key, value))
-                        final_result[eval_dataset.args.task_name + '_dev_' + key] = value
-            eval_results.update(eval_result)
 
-    test_results = {}
-    if training_args.do_predict:
-        logging.info("*** Test ***")
-        test_datasets = [test_dataset]
-        if data_args.task_name == "mnli":
-            mnli_mm_data_args = dataclasses.replace(data_args, task_name="mnli-mm")
-            test_datasets.append(
-                FewShotDataset(mnli_mm_data_args, tokenizer=tokenizer, mode="test", use_demo=('demo' in ml_model_args.few_shot_type))
-            )
+    filter_training_args = torch.load(os.path.join(filter_model_args.filter_model_name_or_path, "training_args.bin"))  
+    data_args = torch.load(os.path.join(filter_model_args.filter_model_name_or_path, "data_args.bin"))  
+    filter_model_name_or_path = filter_model_args.filter_model_name_or_path
+    filter_model_args = torch.load(os.path.join(filter_model_args.filter_model_name_or_path, "model_args.bin"))
+    filter_model_args.filter_model_name_or_path = filter_model_name_or_path
 
-        for test_dataset in test_datasets:
-            trainer.compute_metrics = build_compute_metrics_fn(test_dataset.args.task_name)
-            output = trainer.evaluate(eval_dataset=test_dataset)
-            test_result = output.metrics
+    filter_model_config = AutoConfig.from_pretrained(
+        filter_model_args.filter_config_name if filter_model_args.filter_config_name else filter_model_args.filter_model_name_or_path,
+        num_labels=num_labels,
+        cache_dir=filter_model_args.filter_cache_dir,
+    )
+    filter_tokenizer = AutoTokenizer.from_pretrained(
+        filter_model_args.filter_tokenizer_name if filter_model_args.filter_tokenizer_name else filter_model_args.filter_model_name_or_path,
+        additional_special_tokens=special_tokens,
+        cache_dir=filter_model_args.filter_cache_dir,
+    )
 
-            output_test_file = os.path.join(
-                training_args.output_dir, f"test_results_{test_dataset.args.task_name}.txt"
-            )
-            if trainer.is_world_master():
-                with open(output_test_file, "w") as writer:
-                    logger.info("***** Test results {} *****".format(test_dataset.args.task_name))
-                    for key, value in test_result.items():
-                        logger.info("  %s = %s", key, value)
-                        writer.write("%s = %s\n" % (key, value))
-                        final_result[test_dataset.args.task_name + '_test_' + key] = value
 
-                if training_args.save_logit:
-                    predictions = output.predictions
-                    num_logits = predictions.shape[-1]
-                    logits = predictions.reshape([test_dataset.num_sample, -1, num_logits]).mean(axis=0)
-                    np.save(os.path.join(training_args.save_logit_dir, "{}-{}-{}.npy".format(test_dataset.task_name, training_args.model_id, training_args.array_id)), logits)
 
-            test_results.update(test_result)
+    if filter_model_config.model_type == 'roberta':
+        filter_model_fn = RobertaForSequenceClassification
+    elif filter_model_config.model_type == 'bert':
+        filter_model_fn = BertForSequenceClassification
+    else:
+        raise NotImplementedError
+    special_tokens = []
 
-    with FileLock('log.lock'):
-        with open('log', 'a') as f:
-            final_result.update(vars(ml_model_args))
-            final_result.update(vars(training_args))
-            final_result.update(vars(data_args))
-            if 'evaluation_strategy' in final_result:
-                final_result.pop('evaluation_strategy')
-            f.write(str(final_result) + '\n')
+    filter_model = filter_model_fn.from_pretrained(filter_model_args.filter_model_name_or_path)
+    filter_model = filter_model.to(training_args.device)
+
+
+
+    filter_model.model_args = filter_model_args
+    filter_model.data_args = data_args
+    filter_model.tokenizer = filter_tokenizer
+
+
     
-    return eval_results
+    filter_model.eval()
+    # Initialize our Trainer
+
+    # train_dataset = FewShotDataset(misc_args, data_args, filter_model=filter_model,tokenizer=ml_tokenizer, mode='train')
+    # eval_dataset = FewShotDataset(misc_args, data_args, filter_model=filter_model,tokenizer=ml_tokenizer, mode='dev')
+    # test_dataset = FewShotDataset(misc_args, data_args, filter_model=filter_model,tokenizer=ml_tokenizer, mode='test')
+
+    train_dataset = FewShotDataset(misc_args, data_args, tokenizer=ml_tokenizer, mode='train')
+    eval_dataset = FewShotDataset(misc_args, data_args, tokenizer=ml_tokenizer, mode='dev')
+    # test_dataset = FewShotDataset(misc_args, data_args, tokenizer=ml_tokenizer, mode='test')
+
+    trainer = Trainer(
+        model=ml_model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        compute_metrics=filter_metrics,
+        data_collator = few_shot_data_collator
+    )
+    trainer.train()
+    res = trainer.evaluate()
+    return
+
+def main():
+    misc_args, data_args, generator_args, filter_model_args, ml_model_args, training_args = get_config()
+    # generate_prompts(misc_args,data_args,generator_args)
+    # generate_score(misc_args,data_args,generator_args,ml_model_args,training_args)
+    # train_filter(misc_args,data_args,generator_args,filter_model_args,training_args)
+    train_ml(misc_args, data_args, generator_args, filter_model_args, ml_model_args,training_args)
+
+
 
 if __name__ == "__main__":
     main()

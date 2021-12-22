@@ -102,8 +102,8 @@ class MLModelArguments:
     """
     Arguments pertaining to which model/config/tokenizer we are going to fine-tune from.
     """
-    ml_model_name_or_path: str = field(
-        metadata={
+    ml_model_name_or_path: Optional[str] = field(
+        default=None, metadata={
             "help": "Path to pretrained model or model identifier from huggingface.co/models"}
     )
     ml_config_name: Optional[str] = field(
@@ -127,6 +127,38 @@ class MLModelArguments:
 
     # Only for BERT-type model
     ml_random_segment: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to reinitialize the token type embeddings (only for BERT)."}
+    )
+
+
+@dataclass
+class FilterModelArguments:
+    """
+    Arguments pertaining to which model/config/tokenizer we are going to fine-tune from.
+    """
+    filter_model_name_or_path: Optional[str] = field(
+        default=None, metadata={
+            "help": "Path to pretrained model or model identifier from huggingface.co/models"}
+    )
+    filter_config_name: Optional[str] = field(
+        default=None, metadata={"help": "Pretrained config name or path if not the same as model_name"}
+    )
+    filter_tokenizer_name: Optional[str] = field(
+        default=None, metadata={"help": "Pretrained tokenizer name or path if not the same as model_name"}
+    )
+    filter_cache_dir: Optional[str] = field(
+        default=None, metadata={"help": "Where do you want to store the pretrained models downloaded from s3"}
+    )
+    # Few-shot type
+    #   - finetune: standard fine-tuning
+    #   - prompt: prompt-based fine-tuning
+    #   - prompt-demo: prompt-based fine-tuning with demonstrations
+
+
+    # Only for BERT-type model
+    filter_random_segment: bool = field(
         default=False,
         metadata={
             "help": "Whether to reinitialize the token type embeddings (only for BERT)."}
@@ -259,22 +291,22 @@ class DynamicDataTrainingArguments(GlueDataTrainingArguments):
         metadata={"help": "Use the full length (512)"}
     )
 
-    # GPT-3's in-context learning
-    gpt3_in_context_head: bool = field(
-        default=False,
-        metadata={
-            "help": "GPT-3's in-context learning (context at the beginning)"}
-    )
+    # # GPT-3's in-context learning
+    # gpt3_in_context_head: bool = field(
+    #     default=False,
+    #     metadata={
+    #         "help": "GPT-3's in-context learning (context at the beginning)"}
+    # )
 
-    gpt3_in_context_tail: bool = field(
-        default=False,
-        metadata={"help": "GPT-3's in-context learning (context at the end)"}
-    )
+    # gpt3_in_context_tail: bool = field(
+    #     default=False,
+    #     metadata={"help": "GPT-3's in-context learning (context at the end)"}
+    # )
 
-    gpt3_in_context_num: int = field(
-        default=32,
-        metadata={"help": "Number of context examples"}
-    )
+    # gpt3_in_context_num: int = field(
+    #     default=32,
+    #     metadata={"help": "Number of context examples"}
+    # )
 
     truncate_head: bool = field(
         default=False,
@@ -346,7 +378,7 @@ class DynamicTrainingArguments(TrainingArguments):
 
 def get_config() -> Tuple:
 
-    def _get_config(misc_ars: MiscArgument, data_args: DynamicDataTrainingArguments, generator_args: GeneratorArgument, ml_model_args: MLModelArguments, trainging_args: TrainingArguments):
+    def _get_config(misc_ars: MiscArgument, data_args: DynamicDataTrainingArguments, generator_args: GeneratorArgument, filter_model_args: FilterModelArguments, ml_model_args: MLModelArguments, trainging_args: TrainingArguments):
         generator_args.generator_n_gpu = 0 if trainging_args.no_cuda else torch.cuda.device_count()
         generator_args.generator_device = torch.device(
             "cuda" if torch.cuda.is_available() and not trainging_args.no_cuda else "cpu")
@@ -356,21 +388,22 @@ def get_config() -> Tuple:
             training_args.do_train = False
         if training_args.no_predict:
             training_args.do_predict = False
+        data_args.data_dir = os.path.join(data_args.data_dir,str(data_args.num_k)+'-'+str(misc_ars.global_seed))
 
     parser = HfArgumentParser((MiscArgument, DynamicDataTrainingArguments,
-                              GeneratorArgument, MLModelArguments, DynamicTrainingArguments))
+                              GeneratorArgument, FilterModelArguments, MLModelArguments, DynamicTrainingArguments))
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
         misc_args, data_args, generator_args, ml_model_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
     else:
-        misc_args, data_args, generator_args, ml_model_args, training_args = parser.parse_args_into_dataclasses()
-    _get_config(misc_args, data_args, generator_args,
+        misc_args, data_args, generator_args, filter_model_args, ml_model_args, training_args = parser.parse_args_into_dataclasses()
+    _get_config(misc_args, data_args, generator_args,filter_model_args,
                 ml_model_args, training_args)
     set_seed(misc_args.global_seed)
-    return misc_args, data_args, generator_args, ml_model_args, training_args
+    return misc_args, data_args, generator_args, filter_model_args, ml_model_args, training_args
 
 
 def test():
-    misc_args, data_args, generator_args, ml_model_args, training_args = get_config()
+    misc_args, data_args, generator_args, filter_model_args, ml_model_args, training_args = get_config()
     print('test finish')
 
 

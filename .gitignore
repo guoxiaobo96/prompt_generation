@@ -2,3 +2,6 @@ data/k-shot/
 data/original/
 env/
 .vscode/
+src/__pycache__/
+filter/
+ml/

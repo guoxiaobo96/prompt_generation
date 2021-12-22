@@ -1,9 +1,14 @@
 import torch
 import torch.nn as nn
 import transformers
-from transformers.models.bert import BertPreTrainedModel, BertForSequenceClassification, BertModel, BertOnlyMLMHead
-from transformers.models.roberta import RobertaForSequenceClassification, RobertaModel, RobertaLMHead, RobertaClassificationHead
+from transformers.models.bert import BertPreTrainedModel, BertForSequenceClassification, BertModel
+from transformers.models.bert.modeling_bert import BertOnlyMLMHead
+from transformers.models.roberta import RobertaForSequenceClassification, RobertaModel
+from transformers.models.roberta.modeling_roberta import RobertaLMHead, RobertaClassificationHead
 from transformers.modeling_outputs import SequenceClassifierOutput
+
+from sklearn.metrics import precision_recall_fscore_support, accuracy_score
+import numpy as np
 
 
 def resize_token_type_embeddings(model, new_num_types: int, random_segment: bool):
@@ -23,6 +28,22 @@ def resize_token_type_embeddings(model, new_num_types: int, random_segment: bool
         model.bert.embeddings.token_type_embeddings = new_token_type_embeddings
     else:
         raise NotImplementedError
+
+
+
+from sklearn.metrics import precision_recall_fscore_support
+
+def filter_metrics(pred):
+    labels = pred.label_ids
+    preds = pred.predictions.argmax(-1)
+    precision, recall, f1, _ = precision_recall_fscore_support(labels, preds, average='weighted')
+    acc = accuracy_score(labels, preds)
+    return {
+        'accuracy': acc,
+        'f1': f1,
+        'precision': precision,
+        'recall': recall
+    }
 
 
 class BertForPromptFinetuning(BertPreTrainedModel):
@@ -131,7 +152,7 @@ class RobertaForPromptFinetuning(BertPreTrainedModel):
         # For auto label search.
         self.return_full_softmax = None
 
-    def forward(
+    def get_label(
         self,
         input_ids=None,
         attention_mask=None,
@@ -155,18 +176,74 @@ class RobertaForPromptFinetuning(BertPreTrainedModel):
 
         # Logits over vocabulary tokens
         prediction_mask_scores = self.lm_head(sequence_mask_output)
+        logits = prediction_mask_scores.detach().cpu().numpy()
+        labels = labels.cpu().numpy()
+
+        indices = list()
+        num_labels = np.max(labels) + 1
+        indices = [self.tokenizer.vocab["Ġterrible"],self.tokenizer.vocab["Ġgreat"]]
+        # for idx in range(num_labels):
+        #     label_logits = logits[labels == idx]
+        #     scores = label_logits.mean(axis=0)
+        #     kept = []
+        #     for i in np.argsort(-scores):
+        #         text = self.vocab[i]
+        #         if not text.startswith("Ġ"):
+        #             continue
+        #         kept.append(i)
+        #     indices.extend(kept[:1])
+        return indices
+
+
+
+    def forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        mask_pos=None,
+        labels=None,
+        support_list = None,
+        sentence = None,
+        prompts = None
+    ):
+        batch_size = input_ids.size(0)
+
+        if mask_pos is not None:
+            mask_pos = mask_pos.squeeze()
+
+        label_list = list()
+        for support in support_list:
+            label_list.append(self.get_label(**support))
+        # Encode everything
+        outputs = self.roberta(
+            input_ids,
+            attention_mask=attention_mask
+        )
+
+        # Get <mask> token representation
+        sequence_output, pooled_output = outputs[:2]
+        sequence_mask_output = sequence_output[torch.arange(sequence_output.size(0)), mask_pos]
+
+        # Logits over vocabulary tokens
+        prediction_mask_scores = self.lm_head(sequence_mask_output)
 
         # Exit early and only return mask logits.
-        if self.return_full_softmax:
-            if labels is not None:
-                return torch.zeros(1, out=prediction_mask_scores.new()), prediction_mask_scores
-            return prediction_mask_scores
+        # if self.return_full_softmax:
+        #     if labels is not None:
+        #         return torch.zeros(1, out=prediction_mask_scores.new()), prediction_mask_scores
+        #     return prediction_mask_scores
 
         # Return logits for each label
         logits = []
-        for label_id in range(len(self.label_word_list)):
-            logits.append(prediction_mask_scores[:, self.label_word_list[label_id]].unsqueeze(-1))
-        logits = torch.cat(logits, -1)
+        label_list = np.array(label_list)
+        for label_id in range(len(label_list[0])):
+            single_logits = list()
+            for i, item in enumerate(prediction_mask_scores):
+                single_logits.append(item[label_list[i][label_id]].to(device = labels.device))
+            single_logits = torch.stack(single_logits,-1)
+            logits.append(single_logits.unsqueeze(-1))
+            # logits.append(torch.tensor(single_logits).unsqueeze(-1))
+        logits = torch.cat(logits, -1).to(device = labels.device)
 
         # Regression task
         if self.config.num_labels == 1:

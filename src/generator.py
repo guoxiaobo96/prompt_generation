@@ -73,8 +73,8 @@ class Generator(object):
             raise KeyError(
                 "the model {} you specified is not supported. You are welcome to add it and open a PR :)")
 
-        self._tokenizer = tokenizer_class.from_pretrained(self._generator_args.generator_model_name_or_path)
-        self._model = model_class.from_pretrained(self._generator_args.generator_model_name_or_path)
+        self.tokenizer = tokenizer_class.from_pretrained(self._generator_args.generator_model_name_or_path)
+        self._model = model_class.from_pretrained(self._generator_args.generator_model_name_or_path,pad_token_id=self.tokenizer.eos_token_id)
         self._model.to(self._generator_args.generator_device)
 
         if self._generator_args.generator_fp16:
@@ -85,19 +85,19 @@ class Generator(object):
     def generate(self, prompt_text):
         if self._requires_preprocessing:
             prepare_input = self._PREPROCESSING_FUNCTIONS.get(self._generator_args.generator_model_type)
-            preprocessed_prompt_text = prepare_input(self._generator_args,self._model, self._tokenizer, prompt_text)
+            preprocessed_prompt_text = prepare_input(self._generator_args,self._model, self.tokenizer, prompt_text)
 
             if self._model.__class__.__name__ in ["TransfoXLLMHeadModel"]:
                 tokenizer_kwargs = {"add_space_before_punct_symbol": True}
             else:
                 tokenizer_kwargs = {}
 
-            encoded_prompt = self._tokenizer.encode(
+            encoded_prompt = self.tokenizer.encode(
                 preprocessed_prompt_text, add_special_tokens=False, return_tensors="pt", **tokenizer_kwargs
             )
         else:
             prefix = self._generator_args.generator_prefix
-            encoded_prompt = self._tokenizer.encode(prefix + prompt_text, add_special_tokens=False, return_tensors="pt")
+            encoded_prompt = self.tokenizer.encode(prefix + prompt_text, add_special_tokens=False, return_tensors="pt")
         encoded_prompt = encoded_prompt.to(self._generator_args.generator_device)
         if encoded_prompt.size()[-1] == 0:
             input_ids = None
@@ -122,22 +122,22 @@ class Generator(object):
         generated_sequences = []
 
         for generated_sequence_idx, generated_sequence in enumerate(output_sequences):
-            print(f"=== GENERATED SEQUENCE {generated_sequence_idx + 1} ===")
+            # print(f"=== GENERATED SEQUENCE {generated_sequence_idx + 1} ===")
             generated_sequence = generated_sequence.tolist()
 
             # Decode text
-            text = self._tokenizer.decode(generated_sequence, clean_up_tokenization_spaces=True)
+            text = self.tokenizer.decode(generated_sequence, clean_up_tokenization_spaces=True)
 
             # Remove all text after the stop token
             text = text[: text.find(self._generator_args.generator_stop_token) if self._generator_args.generator_stop_token else None]
 
             # Add the prompt at the beginning of the sequence. Remove the excess text that was used for pre-processing
-            total_sequence = (
-                prompt_text + text[len(self._tokenizer.decode(encoded_prompt[0], clean_up_tokenization_spaces=True)) :]
-            )
+            # total_sequence = (
+            #     prompt_text + text[len(self.tokenizer.decode(encoded_prompt[0], clean_up_tokenization_spaces=True)) :]
+            # )
+            generated_text =  text[len(self.tokenizer.decode(encoded_prompt[0], clean_up_tokenization_spaces=True)) :]
 
-            generated_sequences.append(total_sequence)
-            print(total_sequence)
+            generated_sequences.append((prompt_text, generated_text))
 
         return generated_sequences
 
@@ -202,7 +202,7 @@ class Generator(object):
 
 
 def test():
-    misc_args, generator_args = get_config()
+    misc_args, data_args, generator_args, ml_model_args, training_args = get_config()
     generator = Generator(misc_args, generator_args)
     generator.generate("this is an amazing book")
 
