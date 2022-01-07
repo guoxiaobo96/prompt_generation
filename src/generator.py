@@ -19,8 +19,7 @@ from transformers import (
     XLNetTokenizer,
 )
 
-from config import MiscArgument, GeneratorArgument, get_config
-# from src.config import MiscArgument, GeneratorArgument, get_config
+from .config import MiscArgument, GeneratorArgument, get_config
 
 
 

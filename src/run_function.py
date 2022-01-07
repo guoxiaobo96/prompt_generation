@@ -6,9 +6,7 @@ import os
 import sys
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Optional
-import torch
 
-import numpy as np
 import transformers
 
 from transformers.trainer import Trainer
@@ -18,12 +16,12 @@ from transformers import HfArgumentParser, TrainingArguments, set_seed
 from transformers import BertForSequenceClassification, RobertaForSequenceClassification
 from transformers.utils.dummy_pt_objects import RobertaModel
 
-from dataset import FewShotDataset, PromptDataset, few_shot_data_collator, FilterDataset
-from ml_models import BertForPromptFinetuning, RobertaForPromptFinetuning, resize_token_type_embeddings, filter_metrics
-from processors import processors_mapping, num_labels_mapping, output_modes_mapping, compute_metrics_mapping, bound_mapping
-from config import MiscArgument, DynamicDataTrainingArguments, GeneratorArgument, FilterModelArguments, MLModelArguments, TrainingArguments, get_config
-from generator import Generator
-from trainer import Trainer
+from .dataset import FewShotDataset, PromptDataset, few_shot_data_collator, FilterDataset
+from .ml_models import BertForPromptFinetuning, RobertaForPromptFinetuning, resize_token_type_embeddings, filter_metrics, res_metrics
+from .processors import processors_mapping, num_labels_mapping, output_modes_mapping, compute_metrics_mapping, bound_mapping
+from .config import MiscArgument, DynamicDataTrainingArguments, GeneratorArgument, FilterModelArguments, MLModelArguments, TrainingArguments, get_config
+from .generator import Generator
+from .trainer import Trainer
 
 from filelock import FileLock
 from datetime import datetime
@@ -31,6 +29,9 @@ from datetime import datetime
 from copy import deepcopy
 from tqdm import tqdm
 import json
+import torch
+import random
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -104,7 +105,8 @@ def generate_score(misc_args: MiscArgument, data_args: DynamicDataTrainingArgume
 
 
 
-    for mode in ['train','dev','test']:
+    # for mode in ['train','dev']:
+    for mode in ['test']:
         # Initialize our Trainer
         trainer = Trainer(
             model=model,
@@ -200,6 +202,7 @@ def train_filter(misc_args: MiscArgument, data_args: DynamicDataTrainingArgument
     )
     trainer.train()
     eval_res = trainer.evaluate()
+    print(eval_res)
     if trainer.is_world_process_zero():
         trainer.save_model(training_args.output_dir)
         tokenizer.save_pretrained(training_args.output_dir)
@@ -298,6 +301,7 @@ def train_ml(misc_args: MiscArgument, data_args: DynamicDataTrainingArguments, g
 
     train_dataset = FewShotDataset(misc_args, data_args, tokenizer=ml_tokenizer, mode='train')
     eval_dataset = FewShotDataset(misc_args, data_args, tokenizer=ml_tokenizer, mode='dev')
+    # eval_dataset = FewShotDataset(misc_args, data_args, tokenizer=ml_tokenizer, mode='test')
     # test_dataset = FewShotDataset(misc_args, data_args, tokenizer=ml_tokenizer, mode='test')
 
     trainer = Trainer(
@@ -305,19 +309,21 @@ def train_ml(misc_args: MiscArgument, data_args: DynamicDataTrainingArguments, g
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
-        compute_metrics=filter_metrics,
+        compute_metrics = res_metrics,
         data_collator = few_shot_data_collator
     )
-    trainer.train()
+    # trainer.train()
     res = trainer.evaluate()
+    print(res)
     return
 
 def main():
     misc_args, data_args, generator_args, filter_model_args, ml_model_args, training_args = get_config()
+    set_seed(misc_args.global_seed)
     # generate_prompts(misc_args,data_args,generator_args)
     # generate_score(misc_args,data_args,generator_args,ml_model_args,training_args)
-    # train_filter(misc_args,data_args,generator_args,filter_model_args,training_args)
-    train_ml(misc_args, data_args, generator_args, filter_model_args, ml_model_args,training_args)
+    train_filter(misc_args,data_args,generator_args,filter_model_args,training_args)
+    # train_ml(misc_args, data_args, generator_args, filter_model_args, ml_model_args,training_args)
 
 
 

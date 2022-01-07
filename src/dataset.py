@@ -20,6 +20,7 @@ from typing import List, Optional, Union
 from sentence_transformers import SentenceTransformer, util
 from copy import deepcopy
 import pandas as pd
+import string
 
 
 import random
@@ -32,15 +33,17 @@ from transformers.tokenization_utils_base import BatchEncoding
 InputDataClass = NewType("InputDataClass", Any)
 
 
-from processors import processors_mapping, num_labels_mapping, output_modes_mapping, compute_metrics_mapping, median_mapping
-from config import MiscArgument, DynamicDataTrainingArguments, GeneratorArgument, MLModelArguments, TrainingArguments, get_config
+from .processors import processors_mapping, num_labels_mapping, output_modes_mapping, compute_metrics_mapping, median_mapping
+from .config import MiscArgument, DynamicDataTrainingArguments, GeneratorArgument, MLModelArguments, TrainingArguments, get_config
 
 logger = logging.getLogger(__name__)
 
 
 
-@dataclass(frozen=True)
-class OurSingleInputFeatures(InputFeatures):
+# @dataclass(frozen=True)
+# class OurSingleInputFeatures(InputFeatures):
+@dataclass
+class OurSingleInputFeatures():
     """
     Inherit from Transformers' InputFeatuers.
     """
@@ -54,8 +57,10 @@ class OurSingleInputFeatures(InputFeatures):
 
     # support_list:List[OurInputFeatures] = None
 
-@dataclass(frozen=True)
-class OurInputFeatures(InputFeatures):
+# @dataclass(frozen=True)
+# class OurInputFeatures(InputFeatures):
+@dataclass
+class OurInputFeatures():
     """
     Inherit from Transformers' InputFeatuers.
     """
@@ -129,10 +134,12 @@ def tokenize_multipart_input(
         # If using sentence limit, the total length still exceeds the maximum limit, report a warning
         logger.warn("Input exceeds max_length limit: {}".format(tokenizer.decode(input_ids)))
 
+
     while len(input_ids) < max_length:
         input_ids.append(tokenizer.pad_token_id)
         attention_mask.append(0)
         token_type_ids.append(0)
+
 
     # Truncate
     if len(input_ids) > max_length:
@@ -271,10 +278,12 @@ class FewShotDataset(torch.utils.data.Dataset):
         if self.misc_args.global_debug:
             self.query_examples = self.query_examples[:4]
 
-        for _, example in enumerate(self.query_examples):
+        for i, example in enumerate(self.query_examples):
             prompts = self.prompts_list[example.guid]
-            
-            supports = self.support_examples
+            if mode == 'train':
+                supports = self.support_examples[:i] + self.support_examples[i+1:]
+            else:
+                supports = self.support_examples
             self.features.extend(self.convert_fn(
                 example=example,
                 supports=supports,
@@ -283,8 +292,12 @@ class FewShotDataset(torch.utils.data.Dataset):
                 prompts=prompts,
                 tokenizer = self.tokenizer,
                 label_word_list=self.label_word_list,
-                verbose=True if _ == 0 else False,
+                verbose=True if i == 0 else False,
             ))
+    
+        # for i in range(len(self.features) - 1):
+        #     self.features[i+1].support_list = self.features[0].support_list
+
         self.size = len(self.features)
 
 
@@ -363,12 +376,18 @@ class FewShotDataset(torch.utils.data.Dataset):
             if example.text_b is None:
                 for i, prompt in enumerate(prompts['gen_text_a']):
                     single_example = list()
-                    # prompt_list = prompt.split(' ')
-                    prompt_list = ['']
+                    prompt_list = prompt.split(' ')
+                # for i, prompt in enumerate(prompts['gen_text_a'][:1]):
+                #     single_example = list()
+                #     prompt_list = ['']
                     for index,_ in enumerate(prompt_list):
+                        if index == 0 and len(prompt_list)!=1:
+                            continue
                         new_prompt_list = prompt_list[:index] + [tokenizer.mask_token] +prompt_list[index+1:]
                         new_prompt = ' '.join(new_prompt_list)
                         new_prompt = new_prompt.replace('  ',' ')
+                        if new_prompt[:-1] not in string.punctuation:
+                            new_prompt+='.'
                         example_temp  = copy.deepcopy(example)
                         example_temp.text_a += new_prompt
                         supports_temp = list()
@@ -402,12 +421,6 @@ class FewShotDataset(torch.utils.data.Dataset):
                 support_list.append(OurSingleInputFeatures(**support_input,label=label_map[support.label]))
             features = OurInputFeatures(**query_input, support_list = support_list, label=example_label,sentence=example[2],prompts=example[3])
             features_list.append(features)
-        # if verbose:
-        #     logger.info("*** Example ***")
-        #     logger.info("guid: %s" % (example.guid))
-        #     logger.info("features: %s" % features)
-        #     logger.info("text: %s" % self.tokenizer.decode(features.input_ids))
-
         return features_list
 
     def filter_prompt(self, example_list):
@@ -506,6 +519,7 @@ class FilterDataset(torch.utils.data.Dataset):
                     for line in fp.readlines():
                         item = json.loads(line.strip())
                         guid = "%s-%s" % (mode, index)
+                        # item['text'] = item['text'].replace(tokenizer.mask_token, 'mask')
                         text_a = tokenizer(item['text'],padding='max_length',max_length = self.args.max_seq_length)
                         label = int(item['label'])
                         examples.append(InputFeatures(**text_a, label=label))

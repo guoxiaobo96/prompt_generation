@@ -382,6 +382,7 @@ def get_config() -> Tuple:
         generator_args.generator_n_gpu = 0 if trainging_args.no_cuda else torch.cuda.device_count()
         generator_args.generator_device = torch.device(
             "cuda" if torch.cuda.is_available() and not trainging_args.no_cuda else "cpu")
+        training_args.seed = misc_args.global_seed
         if 'prompt' in ml_model_args.ml_few_shot_type:
             data_args.prompt = True
         if training_args.no_train:
@@ -398,7 +399,6 @@ def get_config() -> Tuple:
         misc_args, data_args, generator_args, filter_model_args, ml_model_args, training_args = parser.parse_args_into_dataclasses()
     _get_config(misc_args, data_args, generator_args,filter_model_args,
                 ml_model_args, training_args)
-    set_seed(misc_args.global_seed)
     return misc_args, data_args, generator_args, filter_model_args, ml_model_args, training_args
 
 

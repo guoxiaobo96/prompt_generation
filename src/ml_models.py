@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-import transformers
 from transformers.models.bert import BertPreTrainedModel, BertForSequenceClassification, BertModel
 from transformers.models.bert.modeling_bert import BertOnlyMLMHead
 from transformers.models.roberta import RobertaForSequenceClassification, RobertaModel
@@ -9,6 +8,8 @@ from transformers.modeling_outputs import SequenceClassifierOutput
 
 from sklearn.metrics import precision_recall_fscore_support, accuracy_score
 import numpy as np
+import itertools
+import multiprocessing
 
 
 def resize_token_type_embeddings(model, new_num_types: int, random_segment: bool):
@@ -44,6 +45,35 @@ def filter_metrics(pred):
         'precision': precision,
         'recall': recall
     }
+
+
+def res_metrics(pred):
+    labels = pred.label_ids
+    preds = pred.predictions.argmax(-1)
+    precision, recall, f1, _ = precision_recall_fscore_support(labels, preds, average='binary')
+    acc = accuracy_score(labels, preds)
+    return {
+        'accuracy': acc,
+        'f1': f1,
+        'precision': precision,
+        'recall': recall
+    }
+
+
+
+def init(train_logits, train_labels):
+    global logits, labels
+    logits = train_logits
+    labels = train_labels
+
+def eval_label(pairing
+):
+    global logits, labels
+    label_logits = np.take(logits, pairing, axis=-1)
+    preds = np.argmax(label_logits, axis=-1)
+    correct = np.sum(preds == labels)
+    return correct / len(labels)
+
 
 
 class BertForPromptFinetuning(BertPreTrainedModel):
@@ -181,19 +211,39 @@ class RobertaForPromptFinetuning(BertPreTrainedModel):
 
         indices = list()
         num_labels = np.max(labels) + 1
-        indices = [self.tokenizer.vocab["Ġterrible"],self.tokenizer.vocab["Ġgreat"]]
-        # for idx in range(num_labels):
-        #     label_logits = logits[labels == idx]
-        #     scores = label_logits.mean(axis=0)
-        #     kept = []
-        #     for i in np.argsort(-scores):
-        #         text = self.vocab[i]
-        #         if not text.startswith("Ġ"):
-        #             continue
-        #         kept.append(i)
-        #     indices.extend(kept[:1])
-        return indices
+        # indices = [self.tokenizer.vocab["Ġterrible"],self.tokenizer.vocab["Ġgreat"]]
+        for idx in range(num_labels):
+            label_logits = logits[labels == idx]
+            scores = label_logits.mean(axis=0)
+            kept = []
+            for i in np.argsort(-scores):
+                text = self.vocab[i]
+                if not text.startswith("Ġ"):
+                    continue
+                kept.append(i)
+            # indices.extend(kept[:100])
+            indices.append(kept[:100])
+        
+        valid_indices = [sorted(list(set(inds))) for inds in indices]
+        pairings = list(itertools.product(*valid_indices))
 
+        pairing_scores = []
+        # with multiprocessing.Pool(initializer=init, initargs=(logits, labels)) as workers:
+        #     chunksize = max(10, int(len(pairings) / 1000))
+        #     for score in workers.imap(eval_label, pairings, chunksize=chunksize):
+        #         pairing_scores.append(score)
+        for pairing in pairings:
+            label_logits = np.take(logits, pairing, axis=-1)
+            preds = np.argmax(label_logits, axis=-1)
+            correct = np.sum(preds == labels)
+            pairing_scores.append(correct / labels.size)
+
+        sorted_score = np.sort(-np.array(pairing_scores), kind='mergesort')
+        sorted_indices = np.argsort(-np.array(pairing_scores), kind='mergesort')
+        best_idx = np.argsort(-np.array(pairing_scores), kind='mergesort')[:1]
+        best_score = [pairing_scores[i] for i in best_idx]
+        indices = [pairings[i] for i in best_idx]
+        return indices[0]
 
 
     def forward(
@@ -214,6 +264,12 @@ class RobertaForPromptFinetuning(BertPreTrainedModel):
         label_list = list()
         for support in support_list:
             label_list.append(self.get_label(**support))
+            # label_list.append([self.tokenizer.vocab["Ġanyway"],self.tokenizer.vocab["ĠAbsolutely"]])
+        # support = support_list[0]
+        # for _ in support_list:
+        #     label_list.append(self.get_label(**support))
+            # label_list.append([self.tokenizer.vocab["Ġanyway"],self.tokenizer.vocab["ĠAbsolutely"]])
+
         # Encode everything
         outputs = self.roberta(
             input_ids,
