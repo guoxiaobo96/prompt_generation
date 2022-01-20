@@ -17,11 +17,11 @@ from transformers import BertForSequenceClassification, RobertaForSequenceClassi
 from transformers.utils.dummy_pt_objects import RobertaModel
 
 from .dataset import FewShotDataset, PromptDataset, few_shot_data_collator, FilterDataset
-from .ml_models import BertForPromptFinetuning, RobertaForPromptFinetuning, resize_token_type_embeddings, filter_metrics, res_metrics
+from .ml_models import BertForPromptFinetuning, RobertaForPromptFinetuning, resize_token_type_embeddings, filter_metrics, res_metrics, acc_metrics
 from .processors import processors_mapping, num_labels_mapping, output_modes_mapping, compute_metrics_mapping, bound_mapping
 from .config import MiscArgument, DynamicDataTrainingArguments, GeneratorArgument, FilterModelArguments, MLModelArguments, TrainingArguments, get_config
 from .generator import Generator
-from .trainer import Trainer
+from .trainer import DynamicTrainer
 
 from filelock import FileLock
 from datetime import datetime
@@ -301,20 +301,30 @@ def train_ml(misc_args: MiscArgument, data_args: DynamicDataTrainingArguments, g
 
     train_dataset = FewShotDataset(misc_args, data_args, tokenizer=ml_tokenizer, mode='train')
     eval_dataset = FewShotDataset(misc_args, data_args, tokenizer=ml_tokenizer, mode='dev')
-    # eval_dataset = FewShotDataset(misc_args, data_args, tokenizer=ml_tokenizer, mode='test')
-    # test_dataset = FewShotDataset(misc_args, data_args, tokenizer=ml_tokenizer, mode='test')
+    test_dataset = FewShotDataset(misc_args, data_args, tokenizer=ml_tokenizer, mode='test')
 
-    trainer = Trainer(
+    # trainer = Trainer(
+    #     model=ml_model,
+    #     args=training_args,
+    #     train_dataset=train_dataset,
+    #     eval_dataset=eval_dataset,
+    #     compute_metrics = res_metrics,
+    #     data_collator = few_shot_data_collator
+    # )
+    trainer = DynamicTrainer(
         model=ml_model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
-        compute_metrics = res_metrics,
+        compute_metrics = acc_metrics,
         data_collator = few_shot_data_collator
     )
-    # trainer.train()
-    res = trainer.evaluate()
-    print(res)
+    trainer.train()
+    eval_res = trainer.evaluate()
+    print(eval_res)
+
+    test_res = trainer.evaluate(eval_dataset = test_dataset)
+    print(test_res)
     return
 
 def main():

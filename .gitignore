@@ -5,3 +5,4 @@ env/
 src/__pycache__/
 filter/
 ml/
+*.sh

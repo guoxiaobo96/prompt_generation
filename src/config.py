@@ -291,6 +291,8 @@ class DynamicDataTrainingArguments(GlueDataTrainingArguments):
         metadata={"help": "Use the full length (512)"}
     )
 
+
+
     # # GPT-3's in-context learning
     # gpt3_in_context_head: bool = field(
     #     default=False,
@@ -375,6 +377,11 @@ class DynamicTrainingArguments(TrainingArguments):
         metadata={"help": "No test"}
     )
 
+    update_epoch: int = field(
+        default=None,
+        metadata={
+            "help": "The epoch for updating the predicton model"}
+    )
 
 def get_config() -> Tuple:
 

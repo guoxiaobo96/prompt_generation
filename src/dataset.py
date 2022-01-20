@@ -377,9 +377,9 @@ class FewShotDataset(torch.utils.data.Dataset):
                 for i, prompt in enumerate(prompts['gen_text_a']):
                     single_example = list()
                     prompt_list = prompt.split(' ')
-                # for i, prompt in enumerate(prompts['gen_text_a'][:1]):
-                #     single_example = list()
-                #     prompt_list = ['']
+                for i, prompt in enumerate(prompts['gen_text_a'][:1]):
+                    single_example = list()
+                    prompt_list = ['']
                     for index,_ in enumerate(prompt_list):
                         if index == 0 and len(prompt_list)!=1:
                             continue

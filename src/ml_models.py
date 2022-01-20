@@ -59,6 +59,14 @@ def res_metrics(pred):
         'recall': recall
     }
 
+def acc_metrics(pred):
+    labels = pred.label_ids
+    preds = pred.predictions.argmax(-1)
+    acc = accuracy_score(labels, preds)
+    return {
+        'acc': acc,
+    }
+
 
 
 def init(train_logits, train_labels):
@@ -248,6 +256,7 @@ class RobertaForPromptFinetuning(BertPreTrainedModel):
 
     def forward(
         self,
+        label_model = None,
         input_ids=None,
         attention_mask=None,
         mask_pos=None,
@@ -261,10 +270,18 @@ class RobertaForPromptFinetuning(BertPreTrainedModel):
         if mask_pos is not None:
             mask_pos = mask_pos.squeeze()
 
+
         label_list = list()
-        for support in support_list:
-            label_list.append(self.get_label(**support))
-            # label_list.append([self.tokenizer.vocab["Ġanyway"],self.tokenizer.vocab["ĠAbsolutely"]])
+        if label_model == None:
+            for support in support_list:
+                label_list.append(self.get_label(**support))
+        else:
+            for support in support_list:
+                label_list.append(label_model.get_label(**support))
+
+        # label_list = list()
+        # for _ in support_list:
+        #     label_list.append([self.tokenizer.vocab["Ġterrible"],self.tokenizer.vocab["Ġgreat"]])
         # support = support_list[0]
         # for _ in support_list:
         #     label_list.append(self.get_label(**support))
