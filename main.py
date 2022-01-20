@@ -16,7 +16,7 @@ from transformers import HfArgumentParser, TrainingArguments, set_seed
 from transformers import BertForSequenceClassification, RobertaForSequenceClassification
 from transformers.utils.dummy_pt_objects import RobertaModel
 
-
+from src.config import get_config
 from src.config import  get_config
 from src.run_function import generate_prompts, generate_score, train_filter, train_ml
 
